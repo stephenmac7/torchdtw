@@ -40,19 +40,18 @@ def dtw_cost_and_path(distances: torch.Tensor, *, step_pattern: str = "symmetric
     :returns: A tuple ``(cost, path)`` where *cost* is a scalar tensor and *path* has shape ``(*, 2)``.
     """
     _check_no_cuda_on_windows(distances)
-    cost, path = torch.ops.torchdtw.dtw_cost_and_path.default(distances.cpu(), _STEP_PATTERNS[step_pattern])
-    return cost.to(distances.device), path.to(distances.device)
+    return torch.ops.torchdtw.dtw_cost_and_path.default(distances, _STEP_PATTERNS[step_pattern])
 
 
 def dtw_path(distances: torch.Tensor, *, step_pattern: str = "symmetric1") -> torch.Tensor:
     """Compute the DTW path of the given ``distances`` 2D tensor.
 
-    No CUDA variant or batched implementation are provided for now.
     :param distances: A 2D tensor of shape (n, m) representing the pairwise distances between two sequences.
     :param step_pattern: Step pattern to use: ``"symmetric1"`` or ``"symmetric2"``.
     :returns: A 2D tensor of shape (*, 2) with the path indices.
     """
-    return torch.ops.torchdtw.dtw_path.default(distances.cpu(), _STEP_PATTERNS[step_pattern]).to(distances.device)
+    _check_no_cuda_on_windows(distances)
+    return torch.ops.torchdtw.dtw_path.default(distances, _STEP_PATTERNS[step_pattern])
 
 
 def dtw_batch(

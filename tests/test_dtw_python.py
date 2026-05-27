@@ -1,5 +1,7 @@
-"""Compare torchdtw symmetric2 with dtw-python."""
+"""Compare torchdtw with dtw-python."""
 
+import numpy as np
+import pytest
 import torch
 from dtw import dtw as dtw_python
 from hypothesis import given
@@ -10,21 +12,20 @@ import torchdtw
 DIM = st.integers(1, 50)
 
 
+@pytest.mark.parametrize("step_pattern", ["symmetric1", "symmetric2"])
 @given(x=DIM, y=DIM)
-def test_symmetric2_distance(x: int, y: int) -> None:
-    """Verify that torchdtw symmetric2 matches dtw-python's normalizedDistance."""
+def test_cost_and_path(step_pattern: str, x: int, y: int) -> None:
+    """Verify that torchdtw cost and path match dtw-python."""
     d = torch.testing.make_tensor((x, y), dtype=torch.float64, device="cpu", low=0.0, high=10.0)
 
-    result = torchdtw.dtw(d, step_pattern="symmetric2")
-    alignment = dtw_python(d.numpy(), step_pattern="symmetric2")
-    expected = alignment.distance / (x + y)
+    cost, path = torchdtw.dtw_cost_and_path(d, step_pattern=step_pattern)
+    alignment = dtw_python(d.numpy(), step_pattern=step_pattern)
 
-    torch.testing.assert_close(
-        result,
-        torch.tensor(expected, dtype=torch.float64),
-        rtol=1e-12,
-        atol=1e-12,
-    )
+    expected_cost = alignment.distance / (x + y if step_pattern == "symmetric2" else len(alignment.index1))
+    torch.testing.assert_close(cost, torch.tensor(expected_cost, dtype=torch.float64), rtol=1e-12, atol=1e-12)
+
+    expected_path = torch.from_numpy(np.stack([alignment.index1, alignment.index2], axis=1).astype(np.int64))
+    torch.testing.assert_close(path, expected_path)
 
 
 @given(x=DIM, y=DIM)
