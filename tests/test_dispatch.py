@@ -4,7 +4,7 @@ import pytest
 import torch
 from hypothesis import given
 
-from torchdtw import dtw, dtw_batch
+from torchdtw import dtw, dtw_batch, dtw_cost_and_path, dtw_path
 
 from .conftest import BATCH, DIM, make_tensor
 
@@ -27,6 +27,32 @@ def test_dtw_dispatch_cpu(dtype: torch.dtype, x: int, y: int) -> None:
     out = dtw(d)
     assert out.dtype == dtype
     assert out.shape == ()
+
+
+@pytest.mark.parametrize("dtype", DISTANCES_DTYPES)
+@pytest.mark.parametrize("step_pattern", ["symmetric1", "symmetric2"])
+@given(x=DIM, y=DIM)
+def test_dtw_cost_and_path_dispatch_cpu(dtype: torch.dtype, step_pattern: str, x: int, y: int) -> None:
+    """Verify that dtw_cost_and_path matches dtw and dtw_path."""
+    d = make_tensor((x, y), dtype=dtype, low=0, high=4)
+    cost, path = dtw_cost_and_path(d, step_pattern=step_pattern)
+    torch.testing.assert_close(cost, dtw(d, step_pattern=step_pattern))
+    torch.testing.assert_close(path, dtw_path(d, step_pattern=step_pattern))
+
+
+@pytest.mark.requires_gpu
+@pytest.mark.parametrize("dtype", DISTANCES_DTYPES)
+@pytest.mark.parametrize("step_pattern", ["symmetric1", "symmetric2"])
+@given(x=DIM, y=DIM)
+def test_dtw_cost_and_path_dispatch_cuda_input(dtype: torch.dtype, step_pattern: str, x: int, y: int) -> None:
+    """Compare dtw_cost_and_path outputs for CPU and CUDA inputs."""
+    d = make_tensor((x, y), dtype=dtype, low=0, high=4)
+    cpu_cost, cpu_path = dtw_cost_and_path(d, step_pattern=step_pattern)
+    cuda_cost, cuda_path = dtw_cost_and_path(d.cuda(), step_pattern=step_pattern)
+    assert cuda_cost.is_cuda
+    assert cuda_path.is_cuda
+    torch.testing.assert_close(cpu_cost, cuda_cost.cpu())
+    torch.testing.assert_close(cpu_path, cuda_path.cpu())
 
 
 @pytest.mark.requires_gpu
