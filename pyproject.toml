@@ -28,6 +28,7 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 test = [
+  "dtw-python>=1.7",
   "hypothesis>=6.142.5",
   "pytest>=8.4.2",
 ]
@@ -71,6 +72,16 @@ ignore-names = ["F"]
 
 [tool.setuptools_scm]
 version_scheme = "no-guess-dev"
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu128" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.uv]
 cache-keys = [

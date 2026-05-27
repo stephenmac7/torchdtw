@@ -8,6 +8,8 @@ from . import _C  # noqa: F401 # ty: ignore[unresolved-import]
 
 __all__ = ["dtw", "dtw_batch"]
 
+_STEP_PATTERNS = {"symmetric1": 1, "symmetric2": 2}
+
 
 class CUDAOnWindowsError(RuntimeError):
     def __init__(self) -> None:
@@ -19,27 +21,32 @@ def _check_no_cuda_on_windows(tensor: torch.Tensor) -> None:
         raise CUDAOnWindowsError
 
 
-def dtw(distances: torch.Tensor) -> torch.Tensor:
+def dtw(distances: torch.Tensor, *, step_pattern: str = "symmetric1") -> torch.Tensor:
     """Compute the DTW cost of the given ``distances`` 2D tensor.
 
     :param distances: A 2D tensor of shape (n, m) representing the pairwise distances between two sequences.
+    :param step_pattern: Step pattern to use: ``"symmetric1"`` or ``"symmetric2"``.
     :returns: A scalar tensor with the cost.
     """
     _check_no_cuda_on_windows(distances)
-    return torch.ops.torchdtw.dtw.default(distances)
+    return torch.ops.torchdtw.dtw.default(distances, _STEP_PATTERNS[step_pattern])
 
 
-def dtw_path(distances: torch.Tensor) -> torch.Tensor:
+def dtw_path(distances: torch.Tensor, *, step_pattern: str = "symmetric1") -> torch.Tensor:
     """Compute the DTW path of the given ``distances`` 2D tensor.
 
     No CUDA variant or batched implementation are provided for now.
     :param distances: A 2D tensor of shape (n, m) representing the pairwise distances between two sequences.
+    :param step_pattern: Step pattern to use: ``"symmetric1"`` or ``"symmetric2"``.
     :returns: A 2D tensor of shape (*, 2) with the path indices.
     """
-    return torch.ops.torchdtw.dtw_path.default(distances.cpu()).to(distances.device)
+    return torch.ops.torchdtw.dtw_path.default(distances.cpu(), _STEP_PATTERNS[step_pattern]).to(distances.device)
 
 
-def dtw_batch(distances: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, *, symmetric: bool) -> torch.Tensor:
+def dtw_batch(
+    distances: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, *, symmetric: bool,
+    step_pattern: str = "symmetric1",
+) -> torch.Tensor:
     """Compute the batched DTW cost on the ``distances`` 4D tensor.
 
     :param distances: A 4D tensor of shape (n1, n2, s1, s2) representing the pairwise distances between two
@@ -47,21 +54,22 @@ def dtw_batch(distances: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, *, sy
     :param sx: A 1D tensor of shape (n1,) representing the lengths of the sequences in the first batch.
     :param sy: A 1D tensor of shape (n2,) representing the lengths of the sequences in the second batch.
     :param symmetric: Whether or not the DTW is symmetric (i.e., the two batches are the same).
+    :param step_pattern: Step pattern to use: ``"symmetric1"`` or ``"symmetric2"``.
     :returns: A 2D tensor of shape (n1, n2) with the costs.
     """
     _check_no_cuda_on_windows(distances)
-    return torch.ops.torchdtw.dtw_batch.default(distances, sx, sy, symmetric)
+    return torch.ops.torchdtw.dtw_batch.default(distances, sx, sy, symmetric, _STEP_PATTERNS[step_pattern])
 
 
 @torch.library.register_fake("torchdtw::dtw")
-def _(distances: torch.Tensor) -> torch.Tensor:
+def _(distances: torch.Tensor, step_pattern: int) -> torch.Tensor:
     """Register the FakeTensor kernel for dtw, for compatibility with torch.compile."""
     torch._check(distances.ndim == 2)
     return torch.empty((), dtype=distances.dtype, layout=distances.layout, device=distances.device)
 
 
 @torch.library.register_fake("torchdtw::dtw_batch")
-def _(distances: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, symmetric: bool) -> torch.Tensor:  # noqa: FBT001
+def _(distances: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, symmetric: bool, step_pattern: int) -> torch.Tensor:  # noqa: FBT001
     """Register the FakeTensor kernel for dtw_batch, for compatibility with torch.compile."""
     torch._check(distances.ndim == 4)
     torch._check(sx.ndim == 1)

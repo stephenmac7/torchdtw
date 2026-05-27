@@ -39,7 +39,8 @@ template <typename T, size_t N> inline PackedTensorAccessor64<T, N> packed_acces
 template <typename scalar_t, typename sx_t, typename index_t>
 __global__ void dtw_kernel(
     PackedTensorAccessor32<scalar_t, 2> out, const PackedTensorAccessor<scalar_t, 4, index_t> distances,
-    const PackedTensorAccessor32<sx_t, 1> sx, const PackedTensorAccessor32<sx_t, 1> sy, bool symmetric) {
+    const PackedTensorAccessor32<sx_t, 1> sx, const PackedTensorAccessor32<sx_t, 1> sy, bool symmetric,
+    int step_pattern) {
   int32_t x, y;
   if (symmetric) {
     const int32_t b = static_cast<int32_t>(blockIdx.x);
@@ -83,23 +84,40 @@ __global__ void dtw_kernel(
     for (int32_t k = threadIdx.x; k < length; k += blockDim.x) {
       const int32_t i = start_i - k;
       const int32_t j = start_j + k;
+      const scalar_t dist = distances_xy[i][j];
       const scalar_t c_up = (i > 0) ? cost_buf[alpha][j] : max_val;
       const scalar_t c_left = (j > 0) ? cost_buf[alpha][j - 1] : max_val;
       const scalar_t c_diag = (i > 0 && j > 0) ? cost_buf[beta][j - 1] : max_val;
-      scalar_t min_cost;
-      uint16_t parent_len;
-      if (c_diag <= c_left && c_diag <= c_up) {
-        min_cost = c_diag;
-        parent_len = len_buf[beta][j - 1];
-      } else if (c_left <= c_up) {
-        min_cost = c_left;
-        parent_len = len_buf[alpha][j - 1];
+      if (step_pattern == 2) {
+        const scalar_t two = static_cast<scalar_t>(2);
+        const scalar_t v_diag = c_diag + two * dist;
+        const scalar_t v_left = c_left + dist;
+        const scalar_t v_up = c_up + dist;
+        scalar_t min_cost;
+        if (v_diag <= v_left && v_diag <= v_up) {
+          min_cost = v_diag;
+        } else if (v_left <= v_up) {
+          min_cost = v_left;
+        } else {
+          min_cost = v_up;
+        }
+        cost_buf[gamma][j] = min_cost;
       } else {
-        min_cost = c_up;
-        parent_len = len_buf[alpha][j];
+        scalar_t min_cost;
+        uint16_t parent_len;
+        if (c_diag <= c_left && c_diag <= c_up) {
+          min_cost = c_diag;
+          parent_len = len_buf[beta][j - 1];
+        } else if (c_left <= c_up) {
+          min_cost = c_left;
+          parent_len = len_buf[alpha][j - 1];
+        } else {
+          min_cost = c_up;
+          parent_len = len_buf[alpha][j];
+        }
+        cost_buf[gamma][j] = dist + min_cost;
+        len_buf[gamma][j] = static_cast<uint16_t>(parent_len + 1);
       }
-      cost_buf[gamma][j] = distances_xy[i][j] + min_cost;
-      len_buf[gamma][j] = static_cast<uint16_t>(parent_len + 1);
     }
     __syncthreads();
 
@@ -111,8 +129,13 @@ __global__ void dtw_kernel(
 
   if (threadIdx.x == 0) {
     const scalar_t final_cost = cost_buf[alpha][M - 1];
-    const uint16_t path_len = len_buf[alpha][M - 1];
-    const scalar_t result = final_cost / static_cast<scalar_t>(path_len);
+    scalar_t result;
+    if (step_pattern == 2) {
+      result = final_cost / static_cast<scalar_t>(N + M);
+    } else {
+      const uint16_t path_len = len_buf[alpha][M - 1];
+      result = final_cost / static_cast<scalar_t>(path_len);
+    }
     out[x][y] = result;
     if (symmetric)
       out[y][x] = result;
@@ -120,7 +143,8 @@ __global__ void dtw_kernel(
 }
 
 template <typename distances_t, typename sx_t>
-void dtw_batch_cuda_impl(Tensor& out, const Tensor& distances, const Tensor& sx, const Tensor& sy, bool symmetric) {
+void dtw_batch_cuda_impl(
+    Tensor& out, const Tensor& distances, const Tensor& sx, const Tensor& sy, bool symmetric, int64_t step_pattern) {
   const int64_t nx = distances.size(0);
   const int64_t ny = distances.size(1);
   const int64_t max_x = distances.size(2);
@@ -138,18 +162,21 @@ void dtw_batch_cuda_impl(Tensor& out, const Tensor& distances, const Tensor& sx,
         packed_accessor64<distances_t, 4>(distances),
         packed_accessor32<sx_t, 1>(sx),
         packed_accessor32<sx_t, 1>(sy),
-        symmetric);
+        symmetric,
+        static_cast<int>(step_pattern));
   } else {
     dtw_kernel<distances_t, sx_t, int32_t><<<num_blocks, num_threads, 0, stream>>>(
         packed_accessor32<distances_t, 2>(out),
         packed_accessor32<distances_t, 4>(distances),
         packed_accessor32<sx_t, 1>(sx),
         packed_accessor32<sx_t, 1>(sy),
-        symmetric);
+        symmetric,
+        static_cast<int>(step_pattern));
   }
 }
 
-Tensor dtw_batch_cuda(const Tensor& distances, const Tensor& sx, const Tensor& sy, bool symmetric) {
+Tensor dtw_batch_cuda(
+    const Tensor& distances, const Tensor& sx, const Tensor& sy, bool symmetric, int64_t step_pattern) {
   STD_TORCH_CHECK(distances.dim() == 4, "distances must be a 4D tensor");
 
   const int64_t nx = distances.size(0);
@@ -165,7 +192,7 @@ Tensor dtw_batch_cuda(const Tensor& distances, const Tensor& sx, const Tensor& s
   STD_TORCH_CHECK(nx > 0 && ny > 0 && max_x > 0 && max_y > 0, "Empty input tensor");
   STD_TORCH_CHECK(max_y <= MAX_DIAG_LEN, "Last dimension > 1638: too large to use CUDA shared memory");
   STD_TORCH_CHECK(
-      max_x + max_y - 1 <= std::numeric_limits<uint16_t>::max(),
+      step_pattern != 1 || max_x + max_y - 1 <= std::numeric_limits<uint16_t>::max(),
       "Sum of sequence lengths exceeds uint16_t path-length capacity");
   STD_TORCH_CHECK(sy.scalar_type() == sx.scalar_type(), "sx and sy dtypes do not match");
 
@@ -182,7 +209,7 @@ Tensor dtw_batch_cuda(const Tensor& distances, const Tensor& sx, const Tensor& s
             "dtw_batch_cuda_impl_2",
             AT_WRAP([&] {
               using sx_t = scalar_t;
-              (dtw_batch_cuda_impl<distances_t, sx_t>(out, distances, sx, sy, symmetric));
+              (dtw_batch_cuda_impl<distances_t, sx_t>(out, distances, sx, sy, symmetric, step_pattern));
             }),
             AT_INTEGRAL_TYPES_V2);
       }),
@@ -192,14 +219,14 @@ Tensor dtw_batch_cuda(const Tensor& distances, const Tensor& sx, const Tensor& s
   return out;
 }
 
-Tensor dtw_cuda(const Tensor& distances) {
+Tensor dtw_cuda(const Tensor& distances, int64_t step_pattern) {
   STD_TORCH_CHECK(distances.dim() == 2, "distances must be a 2D tensor");
   Tensor sx = torch::stable::new_empty(distances, {1}, std::make_optional(torch::headeronly::ScalarType::Long));
   torch::stable::fill_(sx, distances.size(0));
   Tensor sy = torch::stable::new_empty(distances, {1}, std::make_optional(torch::headeronly::ScalarType::Long));
   torch::stable::fill_(sy, distances.size(1));
-  Tensor result =
-      dtw_batch_cuda(torch::stable::view(distances, {1, 1, distances.size(0), distances.size(1)}), sx, sy, false);
+  Tensor result = dtw_batch_cuda(
+      torch::stable::view(distances, {1, 1, distances.size(0), distances.size(1)}), sx, sy, false, step_pattern);
   return torch::stable::view(result, {});
 }
 
