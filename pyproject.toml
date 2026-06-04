@@ -39,7 +39,7 @@ requires = [
   "numpy>=1.26.4",
   "setuptools>=80.9.0",
   "setuptools-scm>=9.2.2",
-  "torch>=2.10.0",
+  "torch>=2.12",
 ]
 build-backend = "setuptools.build_meta"
 
