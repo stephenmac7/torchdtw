@@ -43,7 +43,11 @@ def test_opcheck_dtw_batch_symmetric_cuda(n: int, x: int, low: float, high_minus
     sx = make_tensor((n,), dtype=torch.long, low=1, high=x)
     i, j = torch.triu_indices(n, n)
     sample[i, j] = sample[j, i]
-    opcheck(torch.ops.torchdtw.dtw_batch.default, (sample.cuda(), sx.cuda(), sx.cuda()), {"symmetric": True, "step_pattern": 1})
+    opcheck(
+        torch.ops.torchdtw.dtw_batch.default,
+        (sample.cuda(), sx.cuda(), sx.cuda()),
+        {"symmetric": True, "step_pattern": 1},
+    )
 
 
 @given(n=BATCH, m=BATCH, x=DIM, y=DIM, low=LOW, high_minus_low=HIGH_MINUS_LOW)
@@ -64,4 +68,8 @@ def test_opcheck_dtw_batch_not_symmetric_cuda(
     sample = make_tensor((n, m, x, y), dtype=torch.float32, low=low, high=high_minus_low + low)
     sx = make_tensor((n,), dtype=torch.long, low=1, high=x)
     sy = make_tensor((m,), dtype=torch.long, low=1, high=y)
-    opcheck(torch.ops.torchdtw.dtw_batch.default, (sample.cuda(), sx.cuda(), sy.cuda()), {"symmetric": False, "step_pattern": 1})
+    opcheck(
+        torch.ops.torchdtw.dtw_batch.default,
+        (sample.cuda(), sx.cuda(), sy.cuda()),
+        {"symmetric": False, "step_pattern": 1},
+    )

@@ -6,16 +6,12 @@ from hypothesis import given
 
 from torchdtw import dtw, dtw_batch, dtw_cost_and_path, dtw_path
 
-from .conftest import BATCH, DIM, make_tensor
+from .conftest import BATCH, DIM, assert_equal, make_tensor
 
 FLOATING_DTYPES = [torch.float64, torch.float32, torch.float16, torch.bfloat16]
-SAFE_INTEGRAL_DISTANCES_DTYPES = [torch.int16, torch.int32, torch.int64]
-INTEGRAL_DTYPES = [torch.uint8, torch.int8, *SAFE_INTEGRAL_DISTANCES_DTYPES]
-# 8-bit integer distances can overflow the current scalar_t DTW costs and path-length normalization.
-DISTANCES_DTYPES = FLOATING_DTYPES + [
-    pytest.param(dtype, marks=pytest.mark.skip(reason="8-bit integer DTW accumulation can overflow"))
-    for dtype in [torch.uint8, torch.int8]
-] + SAFE_INTEGRAL_DISTANCES_DTYPES
+INTEGRAL_DTYPES = [torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64]
+DISTANCES_DTYPES = FLOATING_DTYPES + INTEGRAL_DTYPES
+STEP_PATTERNS = ["symmetric1", "symmetric2"]
 SX_DTYPES = [*INTEGRAL_DTYPES, torch.uint16, torch.uint32, torch.uint64]
 
 
@@ -30,19 +26,19 @@ def test_dtw_dispatch_cpu(dtype: torch.dtype, x: int, y: int) -> None:
 
 
 @pytest.mark.parametrize("dtype", DISTANCES_DTYPES)
-@pytest.mark.parametrize("step_pattern", ["symmetric1", "symmetric2"])
+@pytest.mark.parametrize("step_pattern", STEP_PATTERNS)
 @given(x=DIM, y=DIM)
 def test_dtw_cost_and_path_dispatch_cpu(dtype: torch.dtype, step_pattern: str, x: int, y: int) -> None:
     """Verify that dtw_cost_and_path matches dtw and dtw_path."""
     d = make_tensor((x, y), dtype=dtype, low=0, high=4)
     cost, path = dtw_cost_and_path(d, step_pattern=step_pattern)
-    torch.testing.assert_close(cost, dtw(d, step_pattern=step_pattern))
-    torch.testing.assert_close(path, dtw_path(d, step_pattern=step_pattern))
+    assert_equal(cost, dtw(d, step_pattern=step_pattern))
+    assert_equal(path, dtw_path(d, step_pattern=step_pattern))
 
 
 @pytest.mark.requires_gpu
 @pytest.mark.parametrize("dtype", DISTANCES_DTYPES)
-@pytest.mark.parametrize("step_pattern", ["symmetric1", "symmetric2"])
+@pytest.mark.parametrize("step_pattern", STEP_PATTERNS)
 @given(x=DIM, y=DIM)
 def test_dtw_cost_and_path_dispatch_cuda_input(dtype: torch.dtype, step_pattern: str, x: int, y: int) -> None:
     """Compare dtw_cost_and_path outputs for CPU and CUDA inputs."""
@@ -51,8 +47,9 @@ def test_dtw_cost_and_path_dispatch_cuda_input(dtype: torch.dtype, step_pattern:
     cuda_cost, cuda_path = dtw_cost_and_path(d.cuda(), step_pattern=step_pattern)
     assert cuda_cost.is_cuda
     assert cuda_path.is_cuda
-    torch.testing.assert_close(cpu_cost, cuda_cost.cpu())
-    torch.testing.assert_close(cpu_path, cuda_path.cpu())
+    assert_equal(cpu_cost, cuda_cost.cpu())
+    assert_equal(cpu_path, cuda_path.cpu())
+    assert_equal(cuda_cost, dtw(d.cuda(), step_pattern=step_pattern))
 
 
 @pytest.mark.requires_gpu
@@ -61,7 +58,7 @@ def test_dtw_cost_and_path_dispatch_cuda_input(dtype: torch.dtype, step_pattern:
 def test_dtw_dispatch_cuda(dtype: torch.dtype, x: int, y: int) -> None:
     """Compare CPU and CUDA dtw outputs for every supported distances dtype."""
     d = make_tensor((x, y), dtype=dtype, low=0, high=4)
-    torch.testing.assert_close(dtw(d), dtw(d.cuda()).cpu())
+    assert_equal(dtw(d), dtw(d.cuda()).cpu())
 
 
 @pytest.mark.parametrize("dtype", DISTANCES_DTYPES)
@@ -84,7 +81,7 @@ def test_dtw_batch_distances_dispatch_cuda(dtype: torch.dtype, n: int, m: int, x
     d = make_tensor((n, m, x, y), dtype=dtype, low=0, high=4)
     sx = make_tensor((n,), dtype=torch.long, low=1, high=x + 1)
     sy = make_tensor((m,), dtype=torch.long, low=1, high=y + 1)
-    torch.testing.assert_close(
+    assert_equal(
         dtw_batch(d, sx, sy, symmetric=False),
         dtw_batch(d.cuda(), sx.cuda(), sy.cuda(), symmetric=False).cpu(),
     )
@@ -110,9 +107,7 @@ def test_dtw_batch_sx_dispatch_cuda(sx_dtype: torch.dtype, n: int, m: int, x: in
     d = make_tensor((n, m, x, y), dtype=torch.float32, low=0.0, high=1.0)
     sx = make_tensor((n,), dtype=sx_dtype, low=1, high=x + 1)
     sy = make_tensor((m,), dtype=sx_dtype, low=1, high=y + 1)
-    torch.testing.assert_close(
+    assert_equal(
         dtw_batch(d, sx, sy, symmetric=False),
         dtw_batch(d.cuda(), sx.cuda(), sy.cuda(), symmetric=False).cpu(),
-        rtol=0,
-        atol=0,
     )

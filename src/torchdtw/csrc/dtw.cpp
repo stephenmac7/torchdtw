@@ -1,7 +1,7 @@
 #include <Python.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
-#include <tuple>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor.h>
@@ -9,14 +9,19 @@
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/core/TensorAccessor.h>
 #include <torch/headeronly/util/Exception.h>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
-extern "C" {
 /* Creates a dummy empty _C module that can be imported from Python.
    The import from Python will load the .so consisting of this file
    in this extension, so that the STABLE_TORCH_LIBRARY static initializers
-   below are run. */
-PyObject* PyInit__C(void) {
+   below are run.
+   PyMODINIT_FUNC (rather than a bare extern "C") is required: it carries the
+   __declspec(dllexport) that makes the symbol visible on Windows, where
+   PyTorch's BuildExtension suppresses setuptools' automatic /EXPORT:PyInit__C. */
+PyMODINIT_FUNC PyInit__C(void) {
   static struct PyModuleDef module_def = {
       PyModuleDef_HEAD_INIT,
       "_C", /* name of module */
@@ -27,7 +32,6 @@ PyObject* PyInit__C(void) {
   };
   return PyModule_Create(&module_def);
 }
-}
 
 namespace torchdtw {
 
@@ -37,88 +41,95 @@ template <typename T, size_t N> inline TensorAccessor<T, N> accessor(Tensor t) {
   return TensorAccessor<T, N>(reinterpret_cast<T*>(t.data_ptr()), t.sizes().data(), t.strides().data());
 }
 
-template <typename scalar_t> static Tensor compute_dtw_cost(const Tensor& distances, int64_t step_pattern) {
-  const int64_t N = distances.size(0);
-  const int64_t M = distances.size(1);
-  STD_TORCH_CHECK(N > 0 && M > 0, "Empty input tensor");
-  Tensor cost = torch::stable::empty_like(distances);
-  auto cost_a = accessor<scalar_t, 2>(cost);
-  const auto distances_a = accessor<const scalar_t, 2>(distances);
+template <typename scalar_t>
+using acc_t = std::conditional_t<
+    std::is_same_v<scalar_t, torch::headeronly::Half> || std::is_same_v<scalar_t, torch::headeronly::BFloat16>, float,
+    scalar_t>;
 
-  cost_a[0][0] = distances_a[0][0];
-  for (int64_t i = 1; i < N; i++) {
-    cost_a[i][0] = distances_a[i][0] + cost_a[i - 1][0];
-  }
-  for (int64_t j = 1; j < M; j++) {
-    cost_a[0][j] = distances_a[0][j] + cost_a[0][j - 1];
-  }
-  if (step_pattern == 2) {
-    for (int64_t i = 1; i < N; i++) {
-      for (int64_t j = 1; j < M; j++) {
-        const scalar_t d = distances_a[i][j];
-        cost_a[i][j] = std::min(
-            {cost_a[i - 1][j - 1] + static_cast<scalar_t>(2) * d, cost_a[i - 1][j] + d, cost_a[i][j - 1] + d});
-      }
-    }
-  } else {
-    for (int64_t i = 1; i < N; i++) {
-      for (int64_t j = 1; j < M; j++) {
-        cost_a[i][j] = distances_a[i][j] + std::min({cost_a[i - 1][j], cost_a[i - 1][j - 1], cost_a[i][j - 1]});
-      }
-    }
-  }
-  return cost;
+// Step patterns, as named in dtw-python. symmetric1 adds the local distance once per step and normalizes
+// by the path length. symmetric2 weighs the local distance twice on diagonal steps and normalizes by N + M.
+enum StepPattern : int64_t { SYMMETRIC1 = 1, SYMMETRIC2 = 2 };
+
+static void check_step_pattern(int64_t step_pattern) {
+  STD_TORCH_CHECK(
+      step_pattern == SYMMETRIC1 || step_pattern == SYMMETRIC2,
+      "step_pattern must be 1 (symmetric1) or 2 (symmetric2)");
 }
 
 template <typename scalar_t>
-static void step_back(
-    const TensorAccessor<const scalar_t, 2>& cost_a,
-    const TensorAccessor<const scalar_t, 2>& distances_a,
-    int64_t& i,
-    int64_t& j,
-    int64_t step_pattern) {
-  if (step_pattern == 2) {
-    const scalar_t d = distances_a[i][j];
-    const scalar_t c_diag = cost_a[i - 1][j - 1] + static_cast<scalar_t>(2) * d;
-    const scalar_t c_left = cost_a[i][j - 1] + d;
-    const scalar_t c_up = cost_a[i - 1][j] + d;
-    if (c_diag <= c_left && c_diag <= c_up) {
-      i--;
-      j--;
-    } else if (c_left <= c_up) {
-      j--;
-    } else {
-      i--;
+static void compute_dtw_cost(
+    const TensorAccessor<const scalar_t, 2>& distances_a, int64_t N, int64_t M, int64_t step_pattern,
+    acc_t<scalar_t>* cost) {
+  using acc = acc_t<scalar_t>;
+  cost[0] = static_cast<acc>(distances_a[0][0]);
+  for (int64_t i = 1; i < N; i++) {
+    cost[i * M] = static_cast<acc>(distances_a[i][0]) + cost[(i - 1) * M];
+  }
+  for (int64_t j = 1; j < M; j++) {
+    cost[j] = static_cast<acc>(distances_a[0][j]) + cost[j - 1];
+  }
+  if (step_pattern == SYMMETRIC2) {
+    for (int64_t i = 1; i < N; i++) {
+      const auto distances_i = distances_a[i];
+      acc* row = cost + i * M;
+      const acc* prev = row - M;
+      for (int64_t j = 1; j < M; j++) {
+        const acc d = static_cast<acc>(distances_i[j]);
+        row[j] = std::min(
+            {static_cast<acc>(prev[j - 1] + static_cast<acc>(2) * d),
+             static_cast<acc>(prev[j] + d),
+             static_cast<acc>(row[j - 1] + d)});
+      }
     }
   } else {
-    const scalar_t c_up = cost_a[i - 1][j];
-    const scalar_t c_left = cost_a[i][j - 1];
-    const scalar_t c_diag = cost_a[i - 1][j - 1];
-    if (c_diag <= c_left && c_diag <= c_up) {
-      i--;
-      j--;
-    } else if (c_left <= c_up) {
-      j--;
-    } else {
-      i--;
+    for (int64_t i = 1; i < N; i++) {
+      const auto distances_i = distances_a[i];
+      acc* row = cost + i * M;
+      const acc* prev = row - M;
+      for (int64_t j = 1; j < M; j++) {
+        row[j] = static_cast<acc>(distances_i[j]) + std::min({prev[j], prev[j - 1], row[j - 1]});
+      }
     }
+  }
+}
+
+// Move (i, j), with i > 0 and j > 0, to its predecessor on the optimal path.
+// Ties prefer the diagonal, then left, then up.
+template <typename scalar_t>
+static void step_back(
+    const TensorAccessor<const scalar_t, 2>& distances_a, const acc_t<scalar_t>* cost, int64_t M, int64_t step_pattern,
+    int64_t& i, int64_t& j) {
+  using acc = acc_t<scalar_t>;
+  acc c_up = cost[(i - 1) * M + j];
+  acc c_left = cost[i * M + j - 1];
+  acc c_diag = cost[(i - 1) * M + j - 1];
+  if (step_pattern == SYMMETRIC2) {
+    const acc d = static_cast<acc>(distances_a[i][j]);
+    c_up = static_cast<acc>(c_up + d);
+    c_left = static_cast<acc>(c_left + d);
+    c_diag = static_cast<acc>(c_diag + static_cast<acc>(2) * d);
+  }
+  if (c_diag <= c_left && c_diag <= c_up) {
+    i--;
+    j--;
+  } else if (c_left <= c_up) {
+    j--;
+  } else {
+    i--;
   }
 }
 
 template <typename scalar_t>
 static std::vector<std::pair<int64_t, int64_t>> compute_dtw_path(
-    const Tensor& cost, const Tensor& distances, int64_t step_pattern) {
-  const int64_t N = cost.size(0);
-  const int64_t M = cost.size(1);
-  const auto cost_a = accessor<const scalar_t, 2>(cost);
-  const auto distances_a = accessor<const scalar_t, 2>(distances);
+    const TensorAccessor<const scalar_t, 2>& distances_a, const acc_t<scalar_t>* cost, int64_t N, int64_t M,
+    int64_t step_pattern) {
   std::vector<std::pair<int64_t, int64_t>> path;
-  path.reserve(static_cast<size_t>(N + M - 1));
+  path.reserve(N + M - 1);
   int64_t i = N - 1;
   int64_t j = M - 1;
   path.push_back({i, j});
   while (i > 0 && j > 0) {
-    step_back<scalar_t>(cost_a, distances_a, i, j, step_pattern);
+    step_back<scalar_t>(distances_a, cost, M, step_pattern, i, j);
     path.push_back({i, j});
   }
   while (i > 0) {
@@ -133,65 +144,74 @@ static std::vector<std::pair<int64_t, int64_t>> compute_dtw_path(
   return path;
 }
 
+// Length of the optimal path, without materializing it.
 template <typename scalar_t>
-static int64_t compute_dtw_path_length(const Tensor& cost, const Tensor& distances, int64_t step_pattern) {
-  const auto cost_a = accessor<const scalar_t, 2>(cost);
-  const auto distances_a = accessor<const scalar_t, 2>(distances);
-  int64_t i = cost.size(0) - 1;
-  int64_t j = cost.size(1) - 1;
-  int64_t path_length = 1;
+static int64_t compute_dtw_path_length(
+    const TensorAccessor<const scalar_t, 2>& distances_a, const acc_t<scalar_t>* cost, int64_t N, int64_t M,
+    int64_t step_pattern) {
+  int64_t i = N - 1;
+  int64_t j = M - 1;
+  int64_t length = 1;
   while (i > 0 && j > 0) {
-    step_back<scalar_t>(cost_a, distances_a, i, j, step_pattern);
-    path_length++;
+    step_back<scalar_t>(distances_a, cost, M, step_pattern, i, j);
+    length++;
   }
-  return path_length + i + j;
+  return length + i + j;
 }
 
-template <typename scalar_t> struct DtwResult {
-  scalar_t cost;
-  std::vector<std::pair<int64_t, int64_t>> path;
-};
+template <typename scalar_t> static scalar_t normalize_cost(acc_t<scalar_t> cost, int64_t denominator) {
+  // For integral dtypes divide in int64: casting the denominator to a narrow dtype
+  // can yield 0 (e.g. 256 as int8) and trap on integer division by zero.
+  if constexpr (std::is_integral_v<scalar_t>) {
+    return static_cast<scalar_t>(cost / denominator);
+  } else {
+    return static_cast<scalar_t>(cost / static_cast<acc_t<scalar_t>>(denominator));
+  }
+}
 
 template <typename scalar_t>
-static DtwResult<scalar_t> compute_dtw_result(const Tensor& distances, int64_t step_pattern, bool return_path) {
-  Tensor cost = compute_dtw_cost<scalar_t>(distances, step_pattern);
-  const auto cost_a = accessor<const scalar_t, 2>(cost);
-  const scalar_t final_cost = cost_a[cost.size(0) - 1][cost.size(1) - 1];
-
-  DtwResult<scalar_t> result;
-  if (return_path) {
-    result.path = compute_dtw_path<scalar_t>(cost, distances, step_pattern);
+static scalar_t compute_dtw_value(
+    const TensorAccessor<const scalar_t, 2>& distances_a, int64_t N, int64_t M, int64_t step_pattern,
+    std::vector<acc_t<scalar_t>>& workspace) {
+  if (static_cast<int64_t>(workspace.size()) < N * M) {
+    workspace.resize(N * M);
   }
-
-  if (step_pattern == 2) {
-    result.cost = final_cost / static_cast<scalar_t>(cost.size(0) + cost.size(1));
-  } else {
-    const int64_t path_length = return_path ? static_cast<int64_t>(result.path.size())
-                                            : compute_dtw_path_length<scalar_t>(cost, distances, step_pattern);
-    result.cost = final_cost / static_cast<scalar_t>(path_length);
-  }
-  return result;
+  compute_dtw_cost<scalar_t>(distances_a, N, M, step_pattern, workspace.data());
+  const int64_t denominator =
+      step_pattern == SYMMETRIC2 ? N + M
+                                 : compute_dtw_path_length<scalar_t>(distances_a, workspace.data(), N, M, step_pattern);
+  return normalize_cost<scalar_t>(workspace[N * M - 1], denominator);
 }
 
-static Tensor make_path_tensor(const Tensor& distances, const std::vector<std::pair<int64_t, int64_t>>& path) {
-  Tensor out = torch::stable::new_empty(
-      distances, {static_cast<int64_t>(path.size()), 2}, torch::headeronly::ScalarType::Long);
-  std::memcpy(
-      reinterpret_cast<int64_t*>(out.data_ptr()),
-      reinterpret_cast<const int64_t*>(path.data()),
-      static_cast<size_t>(path.size() * 2) * sizeof(int64_t));
-  return out;
+template <typename scalar_t>
+static scalar_t compute_dtw_cost_and_path(
+    const Tensor& distances, int64_t step_pattern, std::vector<std::pair<int64_t, int64_t>>& path) {
+  const int64_t N = distances.size(0);
+  const int64_t M = distances.size(1);
+  const auto distances_a = accessor<const scalar_t, 2>(distances);
+  std::vector<acc_t<scalar_t>> cost(N * M);
+  compute_dtw_cost<scalar_t>(distances_a, N, M, step_pattern, cost.data());
+  path = compute_dtw_path<scalar_t>(distances_a, cost.data(), N, M, step_pattern);
+  const int64_t denominator = step_pattern == SYMMETRIC2 ? N + M : static_cast<int64_t>(path.size());
+  return normalize_cost<scalar_t>(cost[N * M - 1], denominator);
 }
 
 Tensor dtw_cpu(const Tensor& distances, int64_t step_pattern) {
   STD_TORCH_CHECK(distances.dim() == 2, "distances must be a 2D tensor");
+  const int64_t N = distances.size(0);
+  const int64_t M = distances.size(1);
+  STD_TORCH_CHECK(N > 0 && M > 0, "Empty input tensor");
+  check_step_pattern(step_pattern);
   Tensor out = torch::stable::new_empty(distances, {});
   THO_DISPATCH_V2(
       distances.scalar_type(),
       "compute_dtw",
       AT_WRAP([&] {
-        const auto result = compute_dtw_result<scalar_t>(distances, step_pattern, false);
-        torch::stable::fill_(out, result.cost);
+        // Reuse scratch across calls on this thread to avoid malloc/free churn for many small DTWs.
+        thread_local std::vector<acc_t<scalar_t>> workspace;
+        const scalar_t result =
+            compute_dtw_value<scalar_t>(accessor<const scalar_t, 2>(distances), N, M, step_pattern, workspace);
+        torch::stable::fill_(out, result);
       }),
       AT_ALL_TYPES,
       torch::headeronly::ScalarType::Half,
@@ -199,38 +219,29 @@ Tensor dtw_cpu(const Tensor& distances, int64_t step_pattern) {
   return out;
 }
 
-Tensor dtw_path_cpu(const Tensor& distances, int64_t step_pattern) {
+std::tuple<Tensor, Tensor> dtw_cost_and_path_cpu(const Tensor& distances, int64_t step_pattern) {
   STD_TORCH_CHECK(distances.dim() == 2, "distances must be a 2D tensor");
+  STD_TORCH_CHECK(distances.size(0) > 0 && distances.size(1) > 0, "Empty input tensor");
+  check_step_pattern(step_pattern);
+  Tensor cost = torch::stable::new_empty(distances, {});
   std::vector<std::pair<int64_t, int64_t>> path;
   THO_DISPATCH_V2(
       distances.scalar_type(),
-      "compute_dtw_path",
-      AT_WRAP([&] {
-        auto result = compute_dtw_result<scalar_t>(distances, step_pattern, true);
-        path = std::move(result.path);
-      }),
+      "compute_dtw_cost_and_path",
+      AT_WRAP([&] { torch::stable::fill_(cost, compute_dtw_cost_and_path<scalar_t>(distances, step_pattern, path)); }),
       AT_ALL_TYPES,
       torch::headeronly::ScalarType::Half,
       torch::headeronly::ScalarType::BFloat16);
-  return make_path_tensor(distances, path);
+  Tensor out = torch::stable::new_empty(distances, {(int64_t)path.size(), 2}, torch::headeronly::ScalarType::Long);
+  std::memcpy(
+      reinterpret_cast<int64_t*>(out.data_ptr()),
+      reinterpret_cast<const int64_t*>(path.data()),
+      static_cast<size_t>(path.size() * 2) * sizeof(int64_t));
+  return {cost, out};
 }
 
-std::tuple<Tensor, Tensor> dtw_cost_and_path_cpu(const Tensor& distances, int64_t step_pattern) {
-  STD_TORCH_CHECK(distances.dim() == 2, "distances must be a 2D tensor");
-  Tensor cost_out = torch::stable::new_empty(distances, {});
-  Tensor path_out;
-  THO_DISPATCH_V2(
-      distances.scalar_type(),
-      "dtw_cost_and_path",
-      AT_WRAP([&] {
-        auto result = compute_dtw_result<scalar_t>(distances, step_pattern, true);
-        torch::stable::fill_(cost_out, result.cost);
-        path_out = make_path_tensor(distances, result.path);
-      }),
-      AT_ALL_TYPES,
-      torch::headeronly::ScalarType::Half,
-      torch::headeronly::ScalarType::BFloat16);
-  return {cost_out, path_out};
+Tensor dtw_path_cpu(const Tensor& distances, int64_t step_pattern) {
+  return std::get<1>(dtw_cost_and_path_cpu(distances, step_pattern));
 }
 
 template <typename distances_t, typename sx_t>
@@ -241,31 +252,67 @@ void dtw_batch_cpu_impl(
 
   STD_TORCH_CHECK(
       sy.scalar_type() == torch::headeronly::CppTypeToScalarType<sx_t>::value, "sy dtype does not match sx dtype");
-  const auto sx_a = accessor<sx_t, 1>(sx);
-  const auto sy_a = accessor<sx_t, 1>(sy);
+  const auto sx_a = accessor<const sx_t, 1>(sx);
+  const auto sy_a = accessor<const sx_t, 1>(sy);
+  const auto distances_a = accessor<const distances_t, 4>(distances);
   auto out_a = accessor<distances_t, 2>(out);
 
-  torch::stable::parallel_for(0, nx, 1, [&](int64_t start, int64_t end) {
-    for (int64_t i = start; i < end; i++) {
-      const int64_t start_j = symmetric ? i : 0;
-      for (int64_t j = start_j; j < ny; j++) {
-        if (symmetric && i == j)
-          continue;
-        auto t1 = torch::stable::select(distances, 0, i);
-        auto t2 = torch::stable::select(t1, 0, j);
-        auto t3 = torch::stable::narrow(t2, 0, 0, sx_a[i]);
-        auto sub_distances = torch::stable::narrow(t3, 1, 0, sy_a[j]);
-        out_a[i][j] = compute_dtw_result<distances_t>(sub_distances, step_pattern, false).cost;
-        if (symmetric && i != j) {
-          out_a[j][i] = out_a[i][j];
+  for (int64_t i = 0; i < nx; i++) {
+    STD_TORCH_CHECK(static_cast<int64_t>(sx_a[i]) <= distances.size(2), "sx values must not exceed distances.size(2)");
+  }
+  for (int64_t j = 0; j < ny; j++) {
+    STD_TORCH_CHECK(static_cast<int64_t>(sy_a[j]) <= distances.size(3), "sy values must not exceed distances.size(3)");
+  }
+
+  if (symmetric) {
+    // Row i owns the pairs j > i, so a row-parallel split hands row 0 (ny-1 DTWs) and
+    // row nx-1 (none) wildly uneven work. Flatten the upper triangle into a single pair
+    // index b = j*(j-1)/2 + i (0 <= i < j) and parallelize over that, so every worker gets
+    // an equal count of pairs regardless of which rows they fall in.
+    const int64_t num_pairs = nx * (nx - 1) / 2;
+    torch::stable::parallel_for(0, num_pairs, 1, [&](int64_t start, int64_t end) {
+      std::vector<acc_t<distances_t>> workspace;
+      // Seek (i, j) for flat index `start` via the triangular-number inverse, corrected with
+      // integer steps to absorb double rounding; then advance incrementally to avoid a sqrt per pair.
+      int64_t j = static_cast<int64_t>((1.0 + std::sqrt(1.0 + 8.0 * static_cast<double>(start))) / 2.0);
+      while (j > 0 && j * (j - 1) / 2 > start)
+        j--;
+      while ((j + 1) * j / 2 <= start)
+        j++;
+      int64_t i = start - j * (j - 1) / 2;
+      for (int64_t b = start; b < end; b++) {
+        const int64_t N = static_cast<int64_t>(sx_a[i]);
+        const int64_t M = static_cast<int64_t>(sy_a[j]);
+        if (N > 0 && M > 0) {
+          const distances_t value = compute_dtw_value<distances_t>(distances_a[i][j], N, M, step_pattern, workspace);
+          out_a[i][j] = value;
+          out_a[j][i] = value;
+        }
+        if (++i == j) {
+          i = 0;
+          j++;
         }
       }
-    }
-  });
+    });
+  } else {
+    // Each row does exactly ny pairs, so a row-parallel split is already balanced.
+    torch::stable::parallel_for(0, nx, 1, [&](int64_t start, int64_t end) {
+      std::vector<acc_t<distances_t>> workspace;
+      for (int64_t i = start; i < end; i++) {
+        const int64_t N = static_cast<int64_t>(sx_a[i]);
+        for (int64_t j = 0; j < ny; j++) {
+          const int64_t M = static_cast<int64_t>(sy_a[j]);
+          if (N <= 0 || M <= 0)
+            continue;
+          out_a[i][j] = compute_dtw_value<distances_t>(distances_a[i][j], N, M, step_pattern, workspace);
+        }
+      }
+    });
+  }
 }
 
-Tensor dtw_batch_cpu(
-    const Tensor& distances, const Tensor& sx, const Tensor& sy, bool symmetric, int64_t step_pattern) {
+Tensor
+dtw_batch_cpu(const Tensor& distances, const Tensor& sx, const Tensor& sy, bool symmetric, int64_t step_pattern) {
   STD_TORCH_CHECK(distances.dim() == 4, "distances must be a 4D tensor");
   STD_TORCH_CHECK(sx.dim() == 1 && sy.dim() == 1, "sx and sy must be 1D tensors");
   STD_TORCH_CHECK(
@@ -274,6 +321,7 @@ Tensor dtw_batch_cpu(
   STD_TORCH_CHECK(
       !symmetric || distances.size(0) == distances.size(1),
       "symmetric dtw_batch requires distances.size(0) == distances.size(1)");
+  check_step_pattern(step_pattern);
   Tensor out = torch::stable::new_zeros(distances, {distances.size(0), distances.size(1)});
   THO_DISPATCH_V2(
       distances.scalar_type(),
@@ -296,10 +344,10 @@ Tensor dtw_batch_cpu(
 }
 
 STABLE_TORCH_LIBRARY(torchdtw, m) {
-  m.def("dtw(Tensor distances, int step_pattern) -> Tensor");
-  m.def("dtw_path(Tensor distances, int step_pattern) -> Tensor");
-  m.def("dtw_cost_and_path(Tensor distances, int step_pattern) -> (Tensor, Tensor)");
-  m.def("dtw_batch(Tensor distances, Tensor sx, Tensor sy, bool symmetric, int step_pattern) -> Tensor");
+  m.def("dtw(Tensor distances, int step_pattern=1) -> Tensor");
+  m.def("dtw_path(Tensor distances, int step_pattern=1) -> Tensor");
+  m.def("dtw_cost_and_path(Tensor distances, int step_pattern=1) -> (Tensor, Tensor)");
+  m.def("dtw_batch(Tensor distances, Tensor sx, Tensor sy, bool symmetric, int step_pattern=1) -> Tensor");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(torchdtw, CPU, m) {

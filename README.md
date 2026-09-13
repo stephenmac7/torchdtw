@@ -13,64 +13,114 @@ This was originally made for [fastabx](https://github.com/bootphon/fastabx), but
 it can be used in other projects. Only the exact DTW is implemented, there is
 no plan to add variants.
 
+<!-- griffe -->
 ## Usage
- 
-This package provides three functions:
 
-### DTW
+This package provides four functions:
+
+### `dtw`
 
 ```python
-def dtw(distances: torch.Tensor) -> torch.Tensor
+dtw(distances, *, step_pattern='symmetric1')
 ```
 
 Compute the DTW cost of the given ``distances`` 2D tensor.
 
-**Arguments**:
+Use ``+inf`` to mask forbidden alignments. NaN distances are unsupported: the result is
+unspecified and may differ between the CPU and CUDA backends. Integer ``distances`` accumulate
+the cost in their own dtype and may overflow on long sequences; use a wide enough integer dtype
+or a floating dtype.
 
-- `distances`: A 2D tensor of shape (n, m) representing the pairwise distances between two sequences.
+**Parameters:**
 
-**Returns**:
+- **distances** (<code>Tensor</code>) – A 2D tensor of shape (n, m) representing the pairwise distances between two sequences.
+- **step_pattern** (<code>str</code>) – Step pattern, as in dtw-python: ``"symmetric1"`` normalizes the accumulated cost by the
+path length, ``"symmetric2"`` counts diagonal steps twice and normalizes by ``n + m``.
 
-A scalar tensor with the cost.
+**Returns:**
 
-### DTW path
+- <code>Tensor</code> – A scalar tensor with the cost.
 
-```python
-def dtw_path(distances: torch.Tensor) -> torch.Tensor
-```
-
-Compute the DTW path of the given ``distances`` 2D tensor.
-
-No CUDA variant or batched implementation are provided for now.
-
-**Arguments**:
-
-- `distances`: A 2D tensor of shape (n, m) representing the pairwise distances between two sequences.
-
-**Returns**:
-
-A 2D tensor of shape (*, 2) with the path indices.
-
-### Batched DTW
+### `dtw_batch`
 
 ```python
-def dtw_batch(distances: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, *,
-              symmetric: bool) -> torch.Tensor
+dtw_batch(distances, sx, sy, *, symmetric, step_pattern='symmetric1')
 ```
 
 Compute the batched DTW cost on the ``distances`` 4D tensor.
 
-**Arguments**:
+Only the ``(sx[i], sy[j])`` sub-block of each pair is read, so padding beyond the sequence
+lengths is ignored. Every ``sx[i]`` must be ``<= s1`` and every ``sy[j] <= s2``: the CPU backend
+validates this, but the CUDA backend assumes it and reads out of bounds if violated. Use ``+inf``
+to mask forbidden alignments. NaN distances are unsupported: the result is unspecified and may
+differ between the CPU and CUDA backends. Integer ``distances`` accumulate the cost in their own
+dtype and may overflow on long sequences; use a wide enough integer dtype or a floating dtype.
 
-- `distances`: A 4D tensor of shape (n1, n2, s1, s2) representing the pairwise distances between two
+**Parameters:**
+
+- **distances** (<code>Tensor</code>) – A 4D tensor of shape (n1, n2, s1, s2) representing the pairwise distances between two
 batches of sequences.
-- `sx`: A 1D tensor of shape (n1,) representing the lengths of the sequences in the first batch.
-- `sy`: A 1D tensor of shape (n2,) representing the lengths of the sequences in the second batch.
-- `symmetric`: Whether or not the DTW is symmetric (i.e., the two batches are the same).
+- **sx** (<code>Tensor</code>) – A 1D tensor of shape (n1,) representing the lengths of the sequences in the first batch.
+- **sy** (<code>Tensor</code>) – A 1D tensor of shape (n2,) representing the lengths of the sequences in the second batch.
+- **symmetric** (<code>bool</code>) – Whether or not the DTW is symmetric (i.e., the two batches are the same).
+- **step_pattern** (<code>str</code>) – Step pattern, as in dtw-python: ``"symmetric1"`` normalizes the accumulated cost by the
+path length, ``"symmetric2"`` counts diagonal steps twice and normalizes by ``n + m``.
 
-**Returns**:
+**Returns:**
 
-A 2D tensor of shape (n1, n2) with the costs.
+- <code>Tensor</code> – A 2D tensor of shape (n1, n2) with the costs.
+
+### `dtw_cost_and_path`
+
+```python
+dtw_cost_and_path(distances, *, step_pattern='symmetric1')
+```
+
+Compute the DTW cost and path of the given ``distances`` 2D tensor in a single pass.
+
+Equivalent to calling :func:`dtw` and :func:`dtw_path`, but fills the cost matrix only once.
+Use ``+inf`` to mask forbidden alignments. NaN distances are unsupported.
+
+**Parameters:**
+
+- **distances** (<code>Tensor</code>) – A 2D tensor of shape (n, m) representing the pairwise distances between two sequences.
+- **step_pattern** (<code>str</code>) – Step pattern, as in dtw-python: ``"symmetric1"`` normalizes the accumulated cost by the
+path length, ``"symmetric2"`` counts diagonal steps twice and normalizes by ``n + m``.
+
+**Returns:**
+
+- <code>tuple[Tensor, Tensor]</code> – A tuple ``(cost, path)`` with a scalar tensor and a 2D tensor of shape (*, 2) with the path indices.
+
+### `dtw_path`
+
+```python
+dtw_path(distances, *, step_pattern='symmetric1')
+```
+
+Compute the DTW path of the given ``distances`` 2D tensor.
+
+No batched implementation is provided for now.
+Use ``+inf`` to mask forbidden alignments. NaN distances are unsupported and give an
+unspecified path.
+
+**Parameters:**
+
+- **distances** (<code>Tensor</code>) – A 2D tensor of shape (n, m) representing the pairwise distances between two sequences.
+- **step_pattern** (<code>str</code>) – Step pattern, as in dtw-python: ``"symmetric1"`` normalizes the accumulated cost by the
+path length, ``"symmetric2"`` counts diagonal steps twice and normalizes by ``n + m``.
+
+**Returns:**
+
+- <code>Tensor</code> – A 2D tensor of shape (*, 2) with the path indices.
+
+
+<!-- /griffe -->
+
+## Performance
+
+For many DTWs on short sequences, prefer `dtw_batch` over a Python loop of `dtw` calls.
+A single `dtw_batch` launches one CUDA kernel (one block per pair) or one parallel CPU
+loop, amortizing dispatch, allocation, and launch overhead across the whole batch.
 
 ## Benchmark
 
